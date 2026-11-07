@@ -1,6 +1,7 @@
 import base64
 import functools
 import json
+import logging
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Final, cast
@@ -10,16 +11,15 @@ import pytest
 import respx
 
 import litellm
-
-
-
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     TOOL_RESULT_IMAGE_PLACEHOLDER,
-    encrypted_reasoning_signature,
 )
 from litellm.litellm_core_utils.prompt_templates.factory import (
     THOUGHT_SIGNATURE_SEPARATOR,
     _bedrock_converse_messages_pt,
+)
+from litellm.litellm_core_utils.prompt_templates.reasoning_utils import (
+    encrypted_reasoning_signature,
 )
 from litellm.llms.anthropic.messages.adapters.transformation import (
     OPENAI_MAX_TOOL_NAME_LENGTH,
@@ -34,6 +34,7 @@ from litellm.llms.anthropic.messages.native.mid_conversation_system import (
 from litellm.llms.openai.chat.gpt_transformation import OpenAIGPTConfig
 from litellm.types.llms.anthropic import (
     AnthopicMessagesAssistantMessageParam,
+    AnthropicMessagesRequest,
     AnthropicMessagesUserMessageParam,
 )
 from litellm.types.llms.openai import ChatCompletionAssistantToolCall
@@ -80,6 +81,59 @@ def test_native_compaction_response_roundtrip(text: str | None, count: int, expe
     assert result["stop_reason"] == expected_stop
 
 
+_SERVER_AND_CLIENT_TOOL_TURN: Final[tuple[dict[str, object], ...]] = (
+    {
+        "type": "server_tool_use",
+        "id": "srvtoolu_01Fetch",
+        "name": "web_fetch",
+        "input": {"url": "https://example.com/"},
+    },
+    {
+        "type": "web_fetch_tool_result",
+        "tool_use_id": "srvtoolu_01Fetch",
+        "content": {"type": "web_fetch_result", "url": "https://example.com/"},
+    },
+    {"type": "server_tool_use", "id": "srvtoolu_02Search", "name": "web_search", "input": {"query": "Paris"}},
+    {"type": "text", "text": "The page is titled Example."},
+    {"type": "tool_use", "id": "toolu_01Weather", "name": "get_weather", "input": {"city": "Paris"}},
+)
+
+
+def test_claude_server_tool_blocks_survive_the_round_trip_through_chat_completions() -> None:
+    from unittest.mock import MagicMock
+
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
+    anthropic_response: Final = {
+        "id": "msg_01Fetch",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-5-5",
+        "content": list(_SERVER_AND_CLIENT_TOOL_TURN),
+        "stop_reason": "tool_use",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 100, "output_tokens": 50},
+    }
+    raw_response: Final = MagicMock(spec=httpx.Response)
+    raw_response.json.return_value = anthropic_response
+    raw_response.status_code = 200
+    raw_response.headers = {}
+    chat_response: Final = AnthropicConfig().transform_parsed_response(
+        completion_response=anthropic_response,
+        raw_response=raw_response,
+        model_response=ModelResponse(),
+        json_mode=False,
+        prefix_prompt=None,
+    )
+
+    result: Final = LiteLLMAnthropicMessagesAdapter().translate_openai_response_to_anthropic(chat_response)
+
+    assert [(block["type"], block.get("id") or block.get("tool_use_id")) for block in result["content"]] == [
+        (block["type"], block.get("id") or block.get("tool_use_id")) for block in _SERVER_AND_CLIENT_TOOL_TURN
+    ]
+    assert result["stop_reason"] == "tool_use"
+
+
 def test_translate_chat_refusal_to_anthropic_response():
     response = ModelResponse(
         id="chatcmpl-refusal",
@@ -123,6 +177,57 @@ def test_translate_chat_length_takes_precedence_over_refusal():
 
     assert result["stop_reason"] == "max_tokens"
     assert result.get("stop_details") is None
+
+
+@pytest.mark.parametrize(
+    ("provider_specific_fields", "expected_stop_reason"),
+    [({"stop_reason": "pause_turn"}, "pause_turn"), (None, "max_tokens")],
+    ids=["paused_claude_turn", "truncated_turn"],
+)
+def test_translate_chat_length_keeps_a_paused_claude_turn_unfinished(
+    provider_specific_fields: dict[str, object] | None, expected_stop_reason: str
+):
+    """A paused Claude turn reaches chat as ``length``, which a /v1/messages client would read as a cut-off reply."""
+    message: Final = Message(content="Searching", role="assistant", provider_specific_fields=provider_specific_fields)
+    response: Final = ModelResponse(choices=[Choices(index=0, finish_reason="length", message=message)], usage=Usage())
+
+    result: Final = LiteLLMAnthropicMessagesAdapter().translate_openai_response_to_anthropic(response)
+
+    assert result["stop_reason"] == expected_stop_reason
+    assert result["content"] == [{"type": "text", "text": "Searching"}]
+
+
+@pytest.mark.parametrize(
+    ("stop_details", "expected_stop_details"),
+    [
+        (
+            {"type": "refusal", "category": "cyber", "explanation": "I can't help with that."},
+            {"type": "refusal", "category": "cyber", "explanation": "I can't help with that."},
+        ),
+        (
+            {"type": "refusal", "category": 7, "explanation": "I can't help with that."},
+            {"type": "refusal", "category": None, "explanation": "I can't help with that."},
+        ),
+    ],
+    ids=["claude_stop_details", "unreadable_stop_details"],
+)
+def test_translate_claude_refusal_keeps_the_explanation_out_of_the_reply_text(stop_details, expected_stop_details):
+    """Claude's refusal explanation is API metadata, so replaying it as a text block puts words in Claude's mouth."""
+    message: Final = Message(
+        content="Partial answer",
+        role="assistant",
+        refusal=stop_details["explanation"],
+        provider_specific_fields={"stop_reason": "refusal", "stop_details": stop_details},
+    )
+    response: Final = ModelResponse(
+        choices=[Choices(index=0, finish_reason="content_filter", message=message)], usage=Usage()
+    )
+
+    result: Final = LiteLLMAnthropicMessagesAdapter().translate_openai_response_to_anthropic(response)
+
+    assert result["content"] == [{"type": "text", "text": "Partial answer"}]
+    assert result["stop_reason"] == "refusal"
+    assert result.get("stop_details") == expected_stop_details
 
 
 def test_translate_chat_content_filter_to_anthropic_response():
@@ -510,6 +615,190 @@ def test_translate_anthropic_messages_to_openai_drops_bridge_encrypted_reasoning
     assert not result[1].get("thinking_blocks")
     assert result[1]["content"] == "The Norwegian."
     assert [b["signature"] for b in result[2]["thinking_blocks"]] == ["EqQBCkYIAxgCIkA_signed"]
+
+
+def test_chatgpt_messages_keep_encrypted_reasoning_and_replay_it():
+    """chatgpt /v1/messages ends in the Responses API, so the signed block has to survive into the next request."""
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        LiteLLMResponsesTransformationHandler,
+    )
+
+    summary_encrypted: Final = "gAAAA_summary"
+    bytes_encrypted: Final = "gAAAA_bytes"
+    messages: Final = [
+        AnthropicMessagesUserMessageParam(role="user", content="Which city is colder?"),
+        AnthopicMessagesAssistantMessageParam(
+            role="assistant",
+            content=[
+                {
+                    "type": "thinking",
+                    "thinking": "Oslo is colder.",
+                    "signature": encrypted_reasoning_signature(summary_encrypted),
+                },
+                {"type": "redacted_thinking", "data": encrypted_reasoning_signature(bytes_encrypted)},
+                {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Oslo"}},
+            ],
+        ),
+        AnthropicMessagesUserMessageParam(
+            role="user",
+            content=[{"type": "tool_result", "tool_use_id": "call_1", "content": "-7 C"}],
+        ),
+    ]
+
+    kept: Final = LiteLLMAnthropicMessagesAdapter().translate_anthropic_messages_to_openai(
+        messages=messages,
+        model="chatgpt/gpt-6.1-sol",
+        custom_llm_provider="chatgpt",
+    )
+    assistant: Final = kept[1]
+    assert [block["type"] for block in assistant["thinking_blocks"]] == ["thinking", "redacted_thinking"]
+    assert assistant["thinking_blocks"][0]["signature"] == encrypted_reasoning_signature(summary_encrypted)
+    assert assistant["thinking_blocks"][1]["data"] == encrypted_reasoning_signature(bytes_encrypted)
+
+    responses_input, _instructions = LiteLLMResponsesTransformationHandler().convert_chat_completion_messages_to_responses_api(
+        kept
+    )
+    reasoning: Final = tuple(item for item in responses_input if item.get("type") == "reasoning")
+    assert [item["encrypted_content"] for item in reasoning] == [summary_encrypted, bytes_encrypted]
+    types: Final = [item.get("type") for item in responses_input]
+    assert types.index("reasoning") < types.index("function_call")
+
+    stripped: Final = LiteLLMAnthropicMessagesAdapter().translate_anthropic_messages_to_openai(
+        messages=messages,
+        model="gpt-4o",
+        custom_llm_provider="openai",
+    )
+    assert not stripped[1].get("thinking_blocks")
+
+    prefixed: Final = LiteLLMAnthropicMessagesAdapter().translate_anthropic_messages_to_openai(
+        messages=messages,
+        model="responses/gpt-5-mini",
+        custom_llm_provider="openai",
+    )
+    assert prefixed[1]["thinking_blocks"][1]["data"] == encrypted_reasoning_signature(bytes_encrypted)
+
+
+def test_translate_openai_reasoning_items_become_signed_thinking_blocks():
+    encrypted: Final = "gAAAA_outbound"
+    openai_choices: Final = [
+        Choices(
+            message=Message(
+                role="assistant",
+                content="Oslo.",
+                reasoning_items=[
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "encrypted_content": encrypted,
+                        "summary": [{"type": "summary_text", "text": "Oslo is colder."}],
+                    }
+                ],
+                tool_calls=[
+                    ChatCompletionAssistantToolCall(
+                        id="call_1",
+                        type="function",
+                        function=Function(name="get_weather", arguments='{"city": "Oslo"}'),
+                    )
+                ],
+            )
+        )
+    ]
+
+    result: Final = LiteLLMAnthropicMessagesAdapter()._translate_openai_content_to_anthropic(choices=openai_choices)
+
+    assert result[0]["type"] == "thinking"
+    assert result[0]["thinking"] == "Oslo is colder."
+    assert result[0]["signature"] == encrypted_reasoning_signature(encrypted)
+    assert result[1]["type"] == "text"
+    assert result[2]["type"] == "tool_use"
+
+
+def test_translate_openai_reasoning_items_without_summary_become_redacted_thinking():
+    encrypted: Final = "gAAAA_bytes_only"
+    openai_choices: Final = [
+        Choices(
+            message=Message(
+                role="assistant",
+                content=None,
+                reasoning_items=[
+                    {"type": "reasoning", "id": "rs_1", "encrypted_content": encrypted, "summary": []}
+                ],
+            )
+        )
+    ]
+
+    result: Final = LiteLLMAnthropicMessagesAdapter()._translate_openai_content_to_anthropic(choices=openai_choices)
+
+    assert result == [
+        {"type": "redacted_thinking", "data": encrypted_reasoning_signature(encrypted)},
+    ]
+
+
+def test_translate_openai_reasoning_items_are_not_duplicated_when_thinking_blocks_already_carry_them():
+    encrypted: Final = "gAAAA_once"
+    signature: Final = encrypted_reasoning_signature(encrypted)
+    openai_choices: Final = [
+        Choices(
+            message=Message(
+                role="assistant",
+                content="Oslo.",
+                thinking_blocks=[{"type": "redacted_thinking", "data": signature}],
+                reasoning_items=[
+                    {"type": "reasoning", "id": "rs_1", "encrypted_content": encrypted, "summary": []}
+                ],
+            )
+        )
+    ]
+
+    result: Final = LiteLLMAnthropicMessagesAdapter()._translate_openai_content_to_anthropic(choices=openai_choices)
+
+    assert [block["type"] for block in result] == ["redacted_thinking", "text"]
+
+
+def _replayed_reasoning_request(tools: list[dict[str, object]]) -> AnthropicMessagesRequest:
+    return AnthropicMessagesRequest(
+        model="azure/gpt-5.4-nano",
+        max_tokens=64,
+        messages=[
+            AnthropicMessagesUserMessageParam(role="user", content="Which city is colder?"),
+            AnthopicMessagesAssistantMessageParam(
+                role="assistant",
+                content=[
+                    {"type": "redacted_thinking", "data": encrypted_reasoning_signature("gAAAA_azure_tools")},
+                    {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Oslo"}},
+                ],
+            ),
+            AnthropicMessagesUserMessageParam(
+                role="user",
+                content=[{"type": "tool_result", "tool_use_id": "call_1", "content": "-7 C"}],
+            ),
+        ],
+        tools=tools,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tools", "kept"),
+    [
+        pytest.param(
+            [{"name": "get_weather", "input_schema": {"type": "object", "properties": {}}}],
+            True,
+            id="function_tools_bridge_to_responses",
+        ),
+        pytest.param([], False, id="no_tools_stay_on_chat"),
+    ],
+)
+def test_encrypted_reasoning_is_kept_when_the_request_tools_route_it_to_responses(
+    tools: list[dict[str, object]], kept: bool
+) -> None:
+    openai_request, _mapping = LiteLLMAnthropicMessagesAdapter().translate_anthropic_to_openai(
+        _replayed_reasoning_request(tools),
+        custom_llm_provider="azure",
+        api_base="https://keep-check.openai.azure.com",
+    )
+
+    assistant: Final = openai_request["messages"][1]
+    assert bool(assistant.get("thinking_blocks")) is kept
 
 
 def test_translate_anthropic_messages_to_openai_sets_reasoning_content():
@@ -2871,14 +3160,21 @@ def test_translate_completion_input_params_rejects_a_non_numeric_budget_without_
 
 @pytest.mark.parametrize("budget", ["2048", True])
 def test_translate_completion_input_params_drops_a_non_numeric_budget_under_drop_params(
-    budget: object, monkeypatch: pytest.MonkeyPatch
+    budget: object, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
     monkeypatch.setattr(litellm, "drop_params", False)
-    translated: Final = AnthropicAdapter().translate_completion_input_params(
-        _gemini_request_with_budget(budget, drop_params=True)
-    )
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+        translated: Final = AnthropicAdapter().translate_completion_input_params(
+            _gemini_request_with_budget(budget, drop_params=True)
+        )
+    drop_warnings: Final = [record.getMessage() for record in caplog.records if "Dropping" in record.getMessage()]
     assert translated is not None
     assert not {"reasoning_effort", "thinking"} & translated.keys()
+    assert len(drop_warnings) == 1
+    assert all(
+        fragment in drop_warnings[0]
+        for fragment in (f"thinking.budget_tokens={budget!r}", "gemini-2.5-flash", "(drop_params=True)")
+    )
 
 
 def test_translate_openai_content_to_anthropic_reasoning_content_without_thinking_blocks():
@@ -3243,7 +3539,6 @@ def test_translate_openai_response_to_anthropic_input_tokens_no_cache():
     """
     Regression test: input_tokens should equal prompt_tokens when there are no cached tokens.
     """
-    from litellm.types.utils import PromptTokensDetailsWrapper
 
     # Create OpenAI format response without cached tokens
     usage = Usage(
@@ -5468,3 +5763,156 @@ async def test_chat_bridge_tool_result_text_block_without_text_reaches_the_model
             ],
         }
     ]
+
+
+_RETRY_API_BASE: Final = "https://encrypted-retry.openai.azure.com"
+_RETRY_URL: Final = r".*encrypted-retry\.openai\.azure\.com/openai/.*responses.*"
+_RETRY_TOOLS: Final = [{"name": "get_weather", "input_schema": {"type": "object", "properties": {}}}]
+_RETRY_REJECTION: Final = httpx.Response(
+    400,
+    json={
+        "error": {
+            "message": "The encrypted content gAAA_foreign could not be verified.",
+            "type": "invalid_request_error",
+            "param": None,
+            "code": "invalid_encrypted_content",
+        }
+    },
+)
+_UNRELATED_REJECTION: Final = httpx.Response(
+    400, json={"error": {"message": "max_output_tokens is too small", "type": "invalid_request_error"}}
+)
+_RETRY_REPLY: Final = {
+    "id": "resp_retry",
+    "object": "response",
+    "created_at": 1700000000,
+    "status": "completed",
+    "model": "gpt-5.4-nano",
+    "output": [
+        {
+            "type": "message",
+            "id": "msg_retry",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Oslo", "annotations": []}],
+        }
+    ],
+    "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+    "parallel_tool_calls": True,
+    "tool_choice": "auto",
+    "tools": [],
+}
+
+
+def _history_with_foreign_reasoning() -> list[dict[str, object]]:
+    return [
+        {"role": "user", "content": "Which city is colder?"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "redacted_thinking", "data": encrypted_reasoning_signature("gAAA_foreign")},
+                {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Oslo"}},
+            ],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "-7 C"}]},
+    ]
+
+
+def _sent_reasoning_items(request: httpx.Request) -> list[object]:
+    sent: Final = json.loads(request.read())
+    return [item for item in sent["input"] if item.get("type") == "reasoning"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_chat_bridge_httpx")
+async def test_async_messages_retry_once_without_reasoning_the_backend_cannot_decrypt(
+    respx_mock: respx.MockRouter,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    route: Final = respx_mock.post(url__regex=_RETRY_URL).mock(
+        side_effect=[_RETRY_REJECTION, httpx.Response(200, json=_RETRY_REPLY)]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+        response: Final = await litellm.anthropic.messages.acreate(
+            model="azure/gpt-5.4-nano",
+            api_base=_RETRY_API_BASE,
+            api_key="fake-key",
+            api_version="2025-04-01-preview",
+            max_tokens=64,
+            tools=_RETRY_TOOLS,
+            messages=_history_with_foreign_reasoning(),
+        )
+
+    warnings: Final = tuple(
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and record.name == "LiteLLM"
+    )
+    retry_warnings: Final = tuple(message for message in warnings if "retrying once without it" in message)
+    assert route.call_count == 2
+    assert len(_sent_reasoning_items(route.calls[0].request)) == 1
+    assert _sent_reasoning_items(route.calls[1].request) == []
+    assert [block["text"] for block in response["content"] if block["type"] == "text"] == ["Oslo"]
+    assert retry_warnings == (
+        "Backend rejected replayed encrypted reasoning, retrying once without it. "
+        "provider=azure model=azure/gpt-5.4-nano status=400 code=invalid_encrypted_content",
+    )
+    assert all(
+        "gAAA_foreign" not in message and "litellm_encrypted_reasoning:" not in message for message in warnings
+    )
+
+
+@pytest.mark.usefixtures("_chat_bridge_httpx")
+def test_sync_messages_retry_once_without_reasoning_the_backend_cannot_decrypt(
+    respx_mock: respx.MockRouter,
+) -> None:
+    route: Final = respx_mock.post(url__regex=_RETRY_URL).mock(
+        side_effect=[_RETRY_REJECTION, httpx.Response(200, json=_RETRY_REPLY)]
+    )
+
+    response: Final = litellm.anthropic.messages.create(
+        model="azure/gpt-5.4-nano",
+        api_base=_RETRY_API_BASE,
+        api_key="fake-key",
+        api_version="2025-04-01-preview",
+        max_tokens=64,
+        tools=_RETRY_TOOLS,
+        messages=_history_with_foreign_reasoning(),
+    )
+
+    assert route.call_count == 2
+    assert _sent_reasoning_items(route.calls[1].request) == []
+    assert [block["text"] for block in response["content"] if block["type"] == "text"] == ["Oslo"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_chat_bridge_httpx")
+@pytest.mark.parametrize(
+    ("messages", "rejection"),
+    [
+        pytest.param(
+            [{"role": "user", "content": "Which city is colder?"}],
+            _RETRY_REJECTION,
+            id="no_encrypted_reasoning_to_drop",
+        ),
+        pytest.param(_history_with_foreign_reasoning(), _UNRELATED_REJECTION, id="unrelated_rejection"),
+    ],
+)
+async def test_messages_do_not_retry_other_rejections(
+    respx_mock: respx.MockRouter, messages: list[dict[str, object]], rejection: httpx.Response
+) -> None:
+    route: Final = respx_mock.post(url__regex=_RETRY_URL).mock(return_value=rejection)
+
+    with pytest.raises(litellm.BadRequestError):
+        await litellm.anthropic.messages.acreate(
+            model="azure/gpt-5.4-nano",
+            api_base=_RETRY_API_BASE,
+            api_key="fake-key",
+            api_version="2025-04-01-preview",
+            max_tokens=64,
+            tools=_RETRY_TOOLS,
+            messages=messages,
+        )
+
+    assert route.call_count == 1
