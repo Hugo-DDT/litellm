@@ -28,6 +28,7 @@ from ..common_utils import (
     BEDROCK_RUNTIME_OPENAI_CHAT_ROUTE_SUFFIXES,
     BEDROCK_RUNTIME_OPENAI_RESPONSES_ROUTE_SUFFIXES,
     BedrockError,
+    bedrock_request_tool_name_mapping,
     error_response_text,
     get_all_bedrock_regions,
     strip_bedrock_runtime_route_suffix,
@@ -100,7 +101,14 @@ def make_sync_call(
             base_model_iterator.MockResponseIterator(model_response=model_response)
         )
     else:
-        decoder: Final = AWSEventStreamDecoder(model=model, json_mode=json_mode)
+        decoder: Final = AWSEventStreamDecoder(
+            model=model,
+            json_mode=json_mode,
+            tool_name_mappings=bedrock_request_tool_name_mapping(
+                messages,
+                None if optional_params is None else optional_params.get("tools"),
+            ),
+        )
         completion_stream = decoder.iter_bytes(
             response.iter_bytes(chunk_size=stream_chunk_size), response_headers=response.headers
         )

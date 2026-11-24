@@ -55,6 +55,7 @@ from ..common_utils import (
     bedrock_event_chunk_text,
     bedrock_event_stream_header,
     bedrock_event_stream_response,
+    bedrock_request_tool_name_mapping,
     bedrock_stream_event_error_status,
     build_bedrock_stream_error,
     build_bedrock_stream_event_error,
@@ -301,6 +302,10 @@ async def make_call(
                 sync_stream=False,
                 response_format_schema=response_format_schema_from_request(data, json_mode),
             )
+            decoder.tool_name_mappings = bedrock_request_tool_name_mapping(
+                messages,
+                None if optional_params is None else optional_params.get("tools"),
+            )
             completion_stream = decoder.aiter_bytes(
                 aiter_bytes_then_close(response, chunk_size=stream_chunk_size), response_headers=response.headers
             )
@@ -429,7 +434,13 @@ def make_sync_call(
 
 
 class AWSEventStreamDecoder:
-    def __init__(self, model: str, json_mode: bool | None = False) -> None:
+    def __init__(
+        self,
+        model: str,
+        json_mode: bool | None = False,
+        *,
+        tool_name_mappings: Mapping[str, str] | None = None,
+    ) -> None:
         ensure_optional_import("botocore")
         from botocore.parsers import EventStreamJSONParser
 
@@ -439,6 +450,7 @@ class AWSEventStreamDecoder:
         self.tool_calls_index: int | None = None
         self.response_id: str | None = None
         self.json_mode = json_mode
+        self.tool_name_mappings = tool_name_mappings
         self._current_tool_name: str | None = None
         self._thinking_ran = False
         self._thinking_block_index = -1
@@ -538,7 +550,10 @@ class AWSEventStreamDecoder:
             if "toolUse" in start_obj and start_obj["toolUse"] is not None:
                 ## check tool name was formatted by litellm
                 _response_tool_name: Final = start_obj["toolUse"]["name"]
-                response_tool_name: Final = get_bedrock_tool_name(response_tool_name=_response_tool_name)
+                response_tool_name: Final = get_bedrock_tool_name(
+                    response_tool_name=_response_tool_name,
+                    tool_name_mappings=self.tool_name_mappings,
+                )
                 self._current_tool_name = response_tool_name
 
                 # When json_mode is True, suppress the internal json_tool_call

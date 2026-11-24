@@ -6621,12 +6621,6 @@ def make_valid_bedrock_tool_name(input_tool_name: str) -> str:
 
     # Replace any invalid characters with underscores
     valid_string: Final = "".join(replace_invalid(char) for char in bedrock_tool_name)
-
-    if input_tool_name != valid_string:
-        # passed tool name was formatted to become valid
-        # store it internally so we can use for the response
-        litellm.bedrock_tool_name_mappings.set_cache(key=valid_string, value=input_tool_name)
-
     return valid_string
 
 

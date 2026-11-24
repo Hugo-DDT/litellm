@@ -6,7 +6,7 @@ import itertools
 import json
 import re
 import struct
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -19,6 +19,7 @@ from litellm.exceptions import MidStreamFallbackError
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.litellm_logging import _get_provider_request_id
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
 from litellm.llms.bedrock.chat.invoke_handler import (
     AmazonAnthropicClaudeStreamDecoder,
     AmazonOpenAICompatibleStreamDecoder,
@@ -2385,3 +2386,253 @@ async def test_aws_event_stream_decoder_aiter_bytes_closes_its_source_on_aclose(
     await anext(stream)
     await aclose_if_supported(stream)
     assert source_closed.is_set()
+
+
+_COLON_TOOL_NAME: Final = "mcp__srv::get-items"
+_VALID_TOOL_NAME: Final = "mcp__srv__get-items"
+_CONVERSE_MODEL: Final = "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+
+def _function_tool(name: str) -> Mapping[str, object]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "get items",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+
+def _colon_tool_history() -> list[Mapping[str, object]]:
+    return [
+        {"role": "user", "content": "list items"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_colon",
+                    "type": "function",
+                    "function": {"name": _COLON_TOOL_NAME, "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_colon", "content": "[]"},
+        {"role": "user", "content": "again"},
+    ]
+
+
+def _converse_tool_use_body(name: str) -> Mapping[str, object]:
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{"toolUse": {"toolUseId": "tooluse_1", "name": name, "input": {}}}],
+            }
+        },
+        "stopReason": "tool_use",
+        "usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5},
+    }
+
+
+def _converse_text_body() -> Mapping[str, object]:
+    return {
+        "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+    }
+
+
+def _converse_tool_stream(name: str) -> bytes:
+    frames: Final = (
+        ("messageStart", {"role": "assistant"}),
+        (
+            "contentBlockStart",
+            {"contentBlockIndex": 0, "start": {"toolUse": {"toolUseId": "tooluse_1", "name": name}}},
+        ),
+        ("contentBlockDelta", {"contentBlockIndex": 0, "delta": {"toolUse": {"input": "{}"}}}),
+        ("contentBlockStop", {"contentBlockIndex": 0}),
+        ("messageStop", {"stopReason": "tool_use"}),
+        ("metadata", {"usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5}}),
+    )
+    return b"".join(_converse_event_frame(event_type, body) for event_type, body in frames)
+
+
+def _called_tool_name(response, messages: Sequence[object], *, stream: bool) -> str:
+    if not stream:
+        return response.choices[0].message.tool_calls[0].function.name
+    chunks: Final = tuple(response)
+    assembled: Final = litellm.stream_chunk_builder(chunks=list(chunks), messages=list(messages))
+    return assembled.choices[0].message.tool_calls[0].function.name
+
+
+@pytest.fixture
+def _isolated_tool_name_cache() -> Iterator[None]:
+    litellm.bedrock_tool_name_mappings.cache_dict.clear()
+    yield
+    litellm.bedrock_tool_name_mappings.cache_dict.clear()
+
+
+def _converse_completion(
+    *,
+    messages: Sequence[Mapping[str, object]],
+    tools: Sequence[Mapping[str, object]],
+    response_tool_name: str | None,
+    stream: bool,
+    async_client: bool = False,
+) -> object:
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        if stream:
+            assert response_tool_name is not None
+            return httpx.Response(
+                200,
+                content=_converse_tool_stream(response_tool_name),
+                headers=_event_stream_headers(),
+            )
+        body: Final = (
+            _converse_text_body() if response_tool_name is None else _converse_tool_use_body(response_tool_name)
+        )
+        return httpx.Response(200, json=body)
+
+    transport: Final = httpx.MockTransport(handle_request)
+    if async_client:
+        client: HTTPHandler | AsyncHTTPHandler = AsyncHTTPHandler(transport=transport)
+    else:
+        client = HTTPHandler(client=httpx.Client(transport=transport))
+    return litellm.completion(
+        model=_CONVERSE_MODEL,
+        messages=list(messages),
+        tools=list(tools),
+        stream=stream,
+        client=client,
+    )
+
+
+def _seed_colon_tool_request() -> None:
+    _converse_completion(
+        messages=_colon_tool_history(),
+        tools=[_function_tool(_COLON_TOOL_NAME)],
+        response_tool_name=None,
+        stream=False,
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
+def test_later_converse_request_keeps_its_tool_name_after_an_earlier_request_sanitized_one(
+    stream: bool,
+    _aws_test_credentials: None,
+    _isolated_tool_name_cache: None,
+) -> None:
+    _seed_colon_tool_request()
+    messages: Final = [{"role": "user", "content": "call the tool"}]
+    response: Final = _converse_completion(
+        messages=messages,
+        tools=[_function_tool(_VALID_TOOL_NAME)],
+        response_tool_name=_VALID_TOOL_NAME,
+        stream=stream,
+    )
+
+    assert _called_tool_name(response, messages, stream=stream) == _VALID_TOOL_NAME
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
+def test_converse_response_restores_the_tool_name_this_request_sanitized(
+    stream: bool,
+    _aws_test_credentials: None,
+    _isolated_tool_name_cache: None,
+) -> None:
+    messages: Final = [{"role": "user", "content": "call the tool"}]
+    response: Final = _converse_completion(
+        messages=messages,
+        tools=[_function_tool(_COLON_TOOL_NAME)],
+        response_tool_name=_VALID_TOOL_NAME,
+        stream=stream,
+    )
+
+    assert _called_tool_name(response, messages, stream=stream) == _COLON_TOOL_NAME
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
+def test_defined_tool_name_is_not_rewritten_by_another_requests_sanitized_name(
+    stream: bool,
+    _aws_test_credentials: None,
+    _isolated_tool_name_cache: None,
+) -> None:
+    _seed_colon_tool_request()
+    messages: Final = _colon_tool_history()
+    response: Final = _converse_completion(
+        messages=messages,
+        tools=[_function_tool(_VALID_TOOL_NAME)],
+        response_tool_name=_VALID_TOOL_NAME,
+        stream=stream,
+    )
+
+    assert _called_tool_name(response, messages, stream=stream) == _VALID_TOOL_NAME
+
+
+def test_non_streaming_response_restores_a_sanitized_name_when_the_global_cache_is_empty(
+    _isolated_tool_name_cache: None,
+) -> None:
+    response: Final = httpx.Response(200, json=_converse_tool_use_body(_VALID_TOOL_NAME))
+    messages: Final = [{"role": "user", "content": "call the tool"}]
+
+    result: Final = AmazonConverseConfig()._transform_response(
+        model=_CONVERSE_MODEL,
+        response=response,
+        model_response=litellm.ModelResponse(),
+        stream=False,
+        logging_obj=None,
+        optional_params={"tools": [_function_tool(_COLON_TOOL_NAME)]},
+        api_key=None,
+        data={},
+        messages=messages,
+        encoding=None,
+    )
+
+    assert result.choices[0].message.tool_calls[0].function.name == _COLON_TOOL_NAME
+
+
+def test_streaming_response_restores_a_sanitized_name_after_the_global_cache_is_cleared(
+    _aws_test_credentials: None,
+    _isolated_tool_name_cache: None,
+) -> None:
+    messages: Final = [{"role": "user", "content": "call the tool"}]
+    response: Final = _converse_completion(
+        messages=messages,
+        tools=[_function_tool(_COLON_TOOL_NAME)],
+        response_tool_name=_VALID_TOOL_NAME,
+        stream=True,
+    )
+    litellm.bedrock_tool_name_mappings.cache_dict.clear()
+
+    assert _called_tool_name(response, messages, stream=True) == _COLON_TOOL_NAME
+
+
+@pytest.mark.asyncio
+async def test_async_stream_keeps_a_later_requests_tool_name_after_an_earlier_request_sanitized_one(
+    _aws_test_credentials: None,
+    _isolated_tool_name_cache: None,
+) -> None:
+    _seed_colon_tool_request()
+    messages: Final = [{"role": "user", "content": "call the tool"}]
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=_converse_tool_stream(_VALID_TOOL_NAME),
+            headers=_event_stream_headers(),
+        )
+
+    client: Final = AsyncHTTPHandler(transport=httpx.MockTransport(handle_request))
+    response: Final = await litellm.acompletion(
+        model=_CONVERSE_MODEL,
+        messages=list(messages),
+        tools=[_function_tool(_VALID_TOOL_NAME)],
+        stream=True,
+        client=client,
+    )
+    chunks: Final = [chunk async for chunk in response]
+    assembled: Final = litellm.stream_chunk_builder(chunks=chunks, messages=list(messages))
+
+    assert assembled.choices[0].message.tool_calls[0].function.name == _VALID_TOOL_NAME

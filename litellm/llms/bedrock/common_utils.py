@@ -47,6 +47,7 @@ from litellm.litellm_core_utils.optional_imports import ensure_optional_import
 from litellm.litellm_core_utils.prompt_templates.json_schema_utils import (
     schema_property_count,
 )
+from litellm.litellm_core_utils.prompt_templates.mid_conversation_system import message_field, parts_of
 from litellm.litellm_core_utils.url_utils import ensure_api_route
 from litellm.llms.anthropic.common_utils import AnthropicModelInfo
 from litellm.llms.base_llm.anthropic_messages.transformation import (
@@ -1180,20 +1181,101 @@ class ModelResponseIterator:
         return self.model_response
 
 
-def get_bedrock_tool_name(response_tool_name: str) -> str:
+@dataclass(frozen=True, slots=True)
+class _RenamedBedrockTool:
+    sanitized: str
+    original: str
+
+
+def _text_name(value: object) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _tool_definition_name(tool: object) -> str | None:
+    function_name: Final = _text_name(message_field(message_field(tool, "function"), "name"))
+    if function_name is not None:
+        return function_name
+    spec_name: Final = _text_name(message_field(message_field(tool, "toolSpec"), "name"))
+    if spec_name is not None:
+        return spec_name
+    return _text_name(message_field(tool, "name"))
+
+
+def _defined_tool_names(tools: object) -> frozenset[str]:
+    return frozenset(name for name in (_tool_definition_name(tool) for tool in parts_of(tools)) if name is not None)
+
+
+def _iter_history_tool_names(messages: object) -> Iterator[str]:
+    for message in parts_of(messages):
+        for call in parts_of(message_field(message, "tool_calls")):
+            name = _text_name(message_field(message_field(call, "function"), "name"))
+            if name is not None:
+                yield name
+
+
+def _history_tool_names(messages: object) -> tuple[str, ...]:
+    return tuple(_iter_history_tool_names(messages))
+
+
+def _renamed_tool(
+    original: str,
+    defined: frozenset[str],
+    sanitize: Callable[[str], str],
+) -> _RenamedBedrockTool | None:
+    sanitized: Final = sanitize(original)
+    if sanitized == original or sanitized in defined:
+        return None
+    return _RenamedBedrockTool(sanitized=sanitized, original=original)
+
+
+def _unambiguous_original(sanitized: str, renamed: Sequence[_RenamedBedrockTool]) -> str | None:
+    originals: Final = tuple(item.original for item in renamed if item.sanitized == sanitized)
+    unique: Final = tuple(dict.fromkeys(originals))
+    if len(unique) != 1:
+        return None
+    return unique[0]
+
+
+def _unambiguous_pairs(renamed: Sequence[_RenamedBedrockTool]) -> Iterator[tuple[str, str]]:
+    for sanitized in dict.fromkeys(item.sanitized for item in renamed):
+        original = _unambiguous_original(sanitized, renamed)
+        if original is not None:
+            yield sanitized, original
+
+
+def bedrock_request_tool_name_mapping(messages: object, tools: object) -> Mapping[str, str]:
+    """Sanitized name to the original, for names this request actually changed.
+
+    A sanitized name that is itself a tool defined on this request is left out, so a
+    later response keeps that defined name.
     """
-    If litellm formatted the input tool name, we need to convert it back to the original name.
+    from litellm.litellm_core_utils.prompt_templates.factory import make_valid_bedrock_tool_name
 
-    Args:
-        response_tool_name (str): The name of the tool as received from the response.
+    defined: Final = _defined_tool_names(tools)
+    renamed: Final = tuple(
+        item
+        for item in (
+            _renamed_tool(name, defined, make_valid_bedrock_tool_name)
+            for name in (*defined, *_history_tool_names(messages))
+        )
+        if item is not None
+    )
+    return MappingProxyType(dict(_unambiguous_pairs(renamed)))
 
-    Returns:
-        str: The original name of the tool.
-    """
 
-    if response_tool_name in litellm.bedrock_tool_name_mappings.cache_dict:
-        response_tool_name = litellm.bedrock_tool_name_mappings.cache_dict[response_tool_name]
-    return response_tool_name
+def get_bedrock_tool_name(
+    response_tool_name: str,
+    tool_name_mappings: Mapping[str, str] | None = None,
+) -> str:
+    """Restore a tool name this request sanitized. Names outside that mapping stay as returned."""
+    if tool_name_mappings is None:
+        return response_tool_name
+    original: Final = tool_name_mappings.get(response_tool_name)
+    if original is None:
+        return response_tool_name
+    return original
 
 
 # Cache the global regions list at module level

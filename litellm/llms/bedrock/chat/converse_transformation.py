@@ -155,6 +155,7 @@ from ..common_utils import (
     bedrock_model_known_to_accept_cache_points,
     bedrock_reasoning_effort_disabled,
     bedrock_rejects_stop_sequences,
+    bedrock_request_tool_name_mapping,
     get_anthropic_beta_from_headers,
     get_bedrock_tool_name,
     is_bedrock_application_inference_profile_arn,
@@ -3205,7 +3206,9 @@ class AmazonConverseConfig(BaseConfig):
         return message, returned_finish_reason
 
     def _translate_message_content(
-        self, content_blocks: list[ContentBlock]
+        self,
+        content_blocks: list[ContentBlock],
+        tool_name_mappings: Mapping[str, str] | None = None,
     ) -> tuple[
         str,
         list[ChatCompletionToolCallChunk],
@@ -3240,7 +3243,10 @@ class AmazonConverseConfig(BaseConfig):
             if "toolUse" in content:
                 ## check tool name was formatted by litellm
                 _response_tool_name = content["toolUse"]["name"]
-                response_tool_name = get_bedrock_tool_name(response_tool_name=_response_tool_name)
+                response_tool_name = get_bedrock_tool_name(
+                    response_tool_name=_response_tool_name,
+                    tool_name_mappings=tool_name_mappings,
+                )
                 _function_chunk = ChatCompletionToolCallFunctionChunk(
                     name=response_tool_name,
                     arguments=json.dumps(content["toolUse"]["input"]),
@@ -3492,13 +3498,14 @@ class AmazonConverseConfig(BaseConfig):
         reasoningContentBlocks: list[BedrockConverseReasoningContentBlock] | None = None
         citationsContentBlocks: list[CitationsContentBlock] | None = None
 
+        tool_name_mappings: Final = bedrock_request_tool_name_mapping(messages, optional_params.get("tools"))
         if message is not None:
             (
                 content_str,
                 tools,
                 reasoningContentBlocks,
                 citationsContentBlocks,
-            ) = self._translate_message_content(message["content"])
+            ) = self._translate_message_content(message["content"], tool_name_mappings)
 
         # Initialize provider_specific_fields if we have any special content blocks
         provider_specific_fields: Final[dict[str, object]] = {}
