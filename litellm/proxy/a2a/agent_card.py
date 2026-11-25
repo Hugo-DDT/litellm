@@ -69,9 +69,10 @@ def point_agent_card_at_proxy(
     return deepcopy({**agent_card, "url": proxy_url, **pointed_interfaces})
 
 
-# Security scheme exposed by the LiteLLM-fronted agent card. Always replaces
-# whatever upstream advertised — the client must authenticate to the proxy,
-# not the upstream agent.
+# Security scheme exposed by the LiteLLM-fronted agent card, in the 0.3 flat
+# shape. Always replaces whatever upstream advertised. The client must
+# authenticate to the proxy, not the upstream agent. Cards served as 1.0 are
+# rewritten to the protobuf oneof before they are stored or returned.
 LITELLM_SECURITY_SCHEMES: Final[dict[str, dict[str, str]]] = {
     "LiteLLMKey": {
         "type": "http",
@@ -121,6 +122,7 @@ _ALLOWED_TOP_LEVEL_KEYS: Final = {
     "documentationUrl",
     "securitySchemes",
     "security",
+    "securityRequirements",
     "supportsAuthenticatedExtendedCard",
     "signatures",
     # ``url`` is retained on the stored card because the runtime A2A invocation
@@ -226,10 +228,10 @@ def merge_agent_card(
     ]
 
     base["securitySchemes"] = deepcopy(LITELLM_SECURITY_SCHEMES)
-    # Use the standard A2A/OpenAPI ``security`` field for requirements, not
-    # the non-standard ``securityRequirements`` alias. The upstream's own
-    # ``security`` selector is overwritten here because the proxy enforces its
-    # own scheme regardless of what upstream required.
     base["security"] = deepcopy(LITELLM_SECURITY_REQUIREMENTS)
 
-    return {key: value for key, value in base.items() if key in _ALLOWED_TOP_LEVEL_KEYS}
+    from litellm.proxy.a2a.version_convert import align_agent_card_security
+
+    target_version: Final[SupportedA2AVersion] = "1.0" if served_version == "1.0" else "0.3"
+    aligned: Final = align_agent_card_security(base, target_version)
+    return {key: value for key, value in aligned.items() if key in _ALLOWED_TOP_LEVEL_KEYS}

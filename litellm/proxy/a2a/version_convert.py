@@ -24,10 +24,10 @@ The two wire shapes:
   ``Task`` result is a bare object without ``kind``.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from typing import Final, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy.a2a.agent_card import normalize_protocol_version
@@ -38,6 +38,18 @@ JsonDict = dict[str, object]
 
 _V1_SEND_ENVELOPE_KEYS: Final = frozenset({"message", "task"})
 _V1_STREAM_ENVELOPE_KEYS: Final = frozenset({"message", "task", "statusUpdate", "artifactUpdate"})
+_SECURITY_FIELD_NAMES: Final = frozenset({"security", "securitySchemes", "securityRequirements"})
+_V1_SECURITY_SCHEME_KEYS: Final = frozenset(
+    {
+        "apiKeySecurityScheme",
+        "httpAuthSecurityScheme",
+        "oauth2SecurityScheme",
+        "openIdConnectSecurityScheme",
+        "mtlsSecurityScheme",
+    }
+)
+_OBJECT_MAP: Final = TypeAdapter(Mapping[str, object])
+_OBJECT_LIST: Final = TypeAdapter(list[object])
 
 
 def _dump_03(model: BaseModel) -> JsonDict:
@@ -115,19 +127,287 @@ def _detect_card_version(card: JsonDict) -> A2AVersion:
     return "1.0" if "supportedInterfaces" in card else "0.3"
 
 
+def _as_map(value: object) -> Mapping[str, object] | None:
+    try:
+        return _OBJECT_MAP.validate_python(value)
+    except ValidationError:
+        return None
+
+
+def _as_list(value: object) -> Sequence[object] | None:
+    try:
+        return _OBJECT_LIST.validate_python(value)
+    except ValidationError:
+        return None
+
+
+def _is_v1_security_scheme(scheme: object) -> bool:
+    mapping: Final = _as_map(scheme)
+    if mapping is None or len(mapping) != 1:
+        return False
+    key: Final = next(iter(mapping))
+    return key in _V1_SECURITY_SCHEME_KEYS
+
+
+def _is_flat_security_scheme(scheme: object) -> bool:
+    mapping: Final = _as_map(scheme)
+    return mapping is not None and "type" in mapping and not _is_v1_security_scheme(scheme)
+
+
+def _schemes_match_v1(schemes: object) -> bool:
+    if schemes is None:
+        return True
+    mapping: Final = _as_map(schemes)
+    if mapping is None:
+        return False
+    return all(_is_v1_security_scheme(value) for value in mapping.values())
+
+
+def _schemes_match_flat(schemes: object) -> bool:
+    if schemes is None:
+        return True
+    mapping: Final = _as_map(schemes)
+    if mapping is None:
+        return False
+    return all(_is_flat_security_scheme(value) for value in mapping.values())
+
+
+def _security_matches_target(card: Mapping[str, object], target: A2AVersion) -> bool:
+    schemes: Final = card.get("securitySchemes")
+    if target == "1.0":
+        return _schemes_match_v1(schemes) and "security" not in card
+    return _schemes_match_flat(schemes) and "securityRequirements" not in card
+
+
+def _string_scopes(value: object) -> tuple[str, ...]:
+    items: Final = _as_list(value)
+    if items is None:
+        return ()
+    return tuple(item for item in items if isinstance(item, str))
+
+
+def _scope_list_value(value: object) -> JsonDict:
+    mapping: Final = _as_map(value)
+    if mapping is None:
+        return {"list": []}
+    scopes: Final = _as_list(mapping.get("list"))
+    if scopes is None:
+        return {"list": []}
+    return {"list": [item for item in scopes]}
+
+
+def _with_explicit_scope_lists(requirement: Mapping[str, object]) -> JsonDict:
+    schemes: Final = _as_map(requirement.get("schemes"))
+    if schemes is None:
+        return {key: value for key, value in requirement.items()}
+    filled: Final = {name: _scope_list_value(value) for name, value in schemes.items()}
+    return {"schemes": filled}
+
+
+def _copied_map(value: object) -> JsonDict:
+    mapping: Final = _as_map(value)
+    if mapping is None:
+        return {}
+    return {key: item for key, item in mapping.items()}
+
+
+def _flat_scheme_to_v1(scheme: Mapping[str, object]) -> JsonDict:
+    from a2a.compat.v0_3.conversions import MessageToDict, to_core_security_scheme, types_v03
+
+    parsed: Final = types_v03.SecurityScheme.model_validate(dict(scheme))
+    return _copied_map(MessageToDict(to_core_security_scheme(parsed), preserving_proto_field_name=False))
+
+
+def _scheme_to_v1(scheme: object) -> object:
+    if _is_v1_security_scheme(scheme):
+        return scheme
+    mapping: Final = _as_map(scheme)
+    if mapping is None:
+        return scheme
+    try:
+        return _flat_scheme_to_v1(mapping)
+    except Exception as exc:  # noqa: BLE001 - best-effort passthrough
+        verbose_proxy_logger.debug("A2A security scheme conversion failed: %s", exc)
+        return scheme
+
+
+def _schemes_to_v1(schemes: Mapping[str, object]) -> Mapping[str, object]:
+    if all(_is_v1_security_scheme(value) for value in schemes.values()):
+        return schemes
+    return {name: _scheme_to_v1(value) for name, value in schemes.items()}
+
+
+def _flat_requirement_to_v1(requirement: Mapping[str, object]) -> JsonDict:
+    return {"schemes": {name: {"list": list(_string_scopes(raw))} for name, raw in requirement.items()}}
+
+
+def _requirement_to_v1(item: object) -> object:
+    mapping: Final = _as_map(item)
+    if mapping is None:
+        return item
+    if set(mapping) == {"schemes"}:
+        return _with_explicit_scope_lists(mapping)
+    try:
+        return _flat_requirement_to_v1(mapping)
+    except Exception as exc:  # noqa: BLE001 - best-effort passthrough
+        verbose_proxy_logger.debug("A2A security requirement conversion failed: %s", exc)
+        return item
+
+
+def _requirements_to_v1(security: object) -> Sequence[object] | None:
+    items: Final = _as_list(security)
+    if items is None:
+        return None
+    return [_requirement_to_v1(item) for item in items]
+
+
+def _v1_scheme_to_flat(scheme: Mapping[str, object]) -> JsonDict:
+    from a2a.compat.v0_3.conversions import ParseDict, pb2_v10, to_compat_security_scheme
+
+    message: Final = pb2_v10.SecurityScheme()
+    ParseDict(dict(scheme), message, ignore_unknown_fields=True)
+    dumped: Final = _copied_map(
+        to_compat_security_scheme(message).model_dump(  # pyright: ignore[reportAny] # model_dump returns dict[str, Any]
+            by_alias=True,
+            exclude_none=True,
+            mode="json",
+        )
+    )
+    return dumped
+
+
+def _scheme_to_flat(scheme: object) -> object:
+    if not _is_v1_security_scheme(scheme):
+        return scheme
+    mapping: Final = _as_map(scheme)
+    if mapping is None:
+        return scheme
+    try:
+        return _v1_scheme_to_flat(mapping)
+    except Exception as exc:  # noqa: BLE001 - best-effort passthrough
+        verbose_proxy_logger.debug("A2A security scheme lowering failed: %s", exc)
+        return scheme
+
+
+def _schemes_to_flat(schemes: Mapping[str, object]) -> Mapping[str, object]:
+    if all(not _is_v1_security_scheme(value) for value in schemes.values()):
+        return schemes
+    return {name: _scheme_to_flat(value) for name, value in schemes.items()}
+
+
+def _v1_requirement_to_flat(requirement: Mapping[str, object]) -> JsonDict:
+    schemes: Final = _as_map(requirement.get("schemes"))
+    if schemes is None:
+        return {}
+    return {name: list(_string_scopes(value)) for name, value in schemes.items()}
+
+
+def _requirement_to_flat(item: object) -> object:
+    mapping: Final = _as_map(item)
+    if mapping is None or "schemes" not in mapping:
+        return item
+    try:
+        return _v1_requirement_to_flat(mapping)
+    except Exception as exc:  # noqa: BLE001 - best-effort passthrough
+        verbose_proxy_logger.debug("A2A security requirement lowering failed: %s", exc)
+        return item
+
+
+def _requirements_to_flat(security: object) -> Sequence[object] | None:
+    items: Final = _as_list(security)
+    if items is None:
+        return None
+    return [_requirement_to_flat(item) for item in items]
+
+
+def _v1_requirements_from(card: Mapping[str, object]) -> Sequence[object] | None:
+    schemes: Final = card.get("securitySchemes")
+    flat: Final = _as_list(card.get("security"))
+    existing: Final = _as_list(card.get("securityRequirements"))
+    if flat is not None and not _schemes_match_v1(schemes):
+        return _requirements_to_v1(flat)
+    if existing is not None:
+        return _requirements_to_v1(existing)
+    return _requirements_to_v1(flat) if flat is not None else None
+
+
+def _flat_requirements_from(card: Mapping[str, object]) -> Sequence[object] | None:
+    schemes: Final = card.get("securitySchemes")
+    flat: Final = _as_list(card.get("security"))
+    existing: Final = _as_list(card.get("securityRequirements"))
+    if flat is not None and not _schemes_match_v1(schemes):
+        return flat
+    if existing is not None:
+        return _requirements_to_flat(existing)
+    return flat
+
+
+def _card_with_security(
+    card: Mapping[str, object],
+    schemes: object,
+    requirements_field: str | None,
+    requirements: object,
+) -> JsonDict:
+    kept: Final = {key: value for key, value in card.items() if key not in _SECURITY_FIELD_NAMES}
+    with_schemes: Final = {**kept, "securitySchemes": schemes} if "securitySchemes" in card else kept
+    if requirements_field is None:
+        return with_schemes
+    return {**with_schemes, requirements_field: requirements}
+
+
+def _card_with_v1_security(card: Mapping[str, object]) -> JsonDict:
+    schemes: Final = _as_map(card.get("securitySchemes"))
+    requirements: Final = _v1_requirements_from(card)
+    converted: Final = _schemes_to_v1(schemes) if schemes is not None else card.get("securitySchemes")
+    field: Final = "securityRequirements" if requirements is not None else None
+    return _card_with_security(card, converted, field, requirements)
+
+
+def _card_with_flat_security(card: Mapping[str, object]) -> JsonDict:
+    schemes: Final = _as_map(card.get("securitySchemes"))
+    requirements: Final = _flat_requirements_from(card)
+    converted: Final = _schemes_to_flat(schemes) if schemes is not None else card.get("securitySchemes")
+    field: Final = "security" if requirements is not None else None
+    return _card_with_security(card, converted, field, requirements)
+
+
+def align_agent_card_security(card: JsonDict, target: A2AVersion) -> JsonDict:
+    """Return ``card`` with security fields in the wire shape ``target`` expects.
+
+    A card whose ``protocolVersion`` is already 1.0 can still carry the flat 0.3
+    ``securitySchemes`` / ``security`` fields. Callers that would otherwise skip
+    conversion use this so those fields do not leave the proxy unchanged. The same
+    object is returned when the fields already match, and the input is not mutated.
+    """
+    if _security_matches_target(card, target):
+        return card
+    if target == "1.0":
+        return _card_with_v1_security(card)
+    return _card_with_flat_security(card)
+
+
 def normalize_agent_card(card: JsonDict, target: A2AVersion) -> JsonDict:
     """Convert an extended agent card to ``target``.
 
     When lowering to 0.3, ``additionalInterfaces`` is stripped so the conversion never
     re-exposes upstream backend URLs that the LiteLLM-fronting merge deliberately drops.
+    Security fields are aligned to ``target`` even when the rest of the card already
+    matches that version.
     """
     if not isinstance(card, dict):
         return card
 
     current: Final = _detect_card_version(card)
-    if current == target and not (target == "0.3" and "supportedInterfaces" in card):
-        return card
-    return _best_effort(lambda: _convert_agent_card(card, target), card, label="agent card")
+    converted: Final = (
+        card
+        if current == target and not (target == "0.3" and "supportedInterfaces" in card)
+        else _best_effort(lambda: _convert_agent_card(card, target), card, label="agent card")
+    )
+    return _best_effort(
+        lambda: align_agent_card_security(converted, target),
+        converted,
+        label="agent card security",
+    )
 
 
 def _as_request_id(value: object) -> RequestId:

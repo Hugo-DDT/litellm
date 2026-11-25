@@ -121,9 +121,7 @@ def test_request_params_lowering_is_noop_for_0_3():
 
 
 def test_request_params_lowering_get_task_to_0_3():
-    out = normalize_request_params(
-        {"id": "t1", "historyLength": 5}, "1.0", method="tasks/get"
-    )
+    out = normalize_request_params({"id": "t1", "historyLength": 5}, "1.0", method="tasks/get")
     assert out["id"] == "t1"
     assert out["historyLength"] == 5
 
@@ -315,11 +313,85 @@ def test_agent_card_same_version_passthrough():
     assert normalize_agent_card(card, "1.0") is card
 
 
+def _persisted_flat_security_card(protocol_version: str) -> dict:
+    return {
+        "protocolVersion": protocol_version,
+        "name": "Example Agent",
+        "description": "Example agent.",
+        "url": "https://proxy.example/a2a/example-agent",
+        "version": "1.0.0",
+        "securitySchemes": {
+            "LiteLLMKey": {
+                "type": "http",
+                "scheme": "bearer",
+                "description": "LiteLLM virtual key",
+            }
+        },
+        "security": [{"LiteLLMKey": []}],
+        "supportedInterfaces": [
+            {
+                "url": "https://proxy.example/a2a/example-agent",
+                "protocolBinding": "JSONRPC",
+                "protocolVersion": protocol_version,
+            }
+        ],
+    }
+
+
+_V1_LITELLM_SECURITY_SCHEMES = {
+    "LiteLLMKey": {
+        "httpAuthSecurityScheme": {
+            "description": "LiteLLM virtual key",
+            "scheme": "bearer",
+        }
+    }
+}
+
+_V1_LITELLM_SECURITY_REQUIREMENTS = [{"schemes": {"LiteLLMKey": {"list": []}}}]
+
+
+def test_served_1_0_card_converts_persisted_flat_security():
+    card = _persisted_flat_security_card("1.0")
+    out = normalize_agent_card(card, "1.0")
+    scheme = out["securitySchemes"]["LiteLLMKey"]
+    assert out["securitySchemes"] == _V1_LITELLM_SECURITY_SCHEMES
+    assert out["securityRequirements"] == _V1_LITELLM_SECURITY_REQUIREMENTS
+    assert "security" not in out
+    assert list(scheme) == ["httpAuthSecurityScheme"]
+    assert "type" not in scheme
+    assert out["protocolVersion"] == "1.0"
+    assert out["url"] == card["url"]
+    assert out["name"] == card["name"]
+    assert out["supportedInterfaces"] == card["supportedInterfaces"]
+    assert card["security"] == [{"LiteLLMKey": []}]
+    assert card["securitySchemes"]["LiteLLMKey"]["type"] == "http"
+
+
+def test_served_0_3_card_keeps_flat_security():
+    card = _persisted_flat_security_card("0.3")
+    out = normalize_agent_card(card, "0.3")
+    assert out["securitySchemes"] == {
+        "LiteLLMKey": {
+            "type": "http",
+            "scheme": "bearer",
+            "description": "LiteLLM virtual key",
+        }
+    }
+    assert out["security"] == [{"LiteLLMKey": []}]
+    assert "securityRequirements" not in out
+    assert out["protocolVersion"] == "0.3"
+
+
+def test_served_1_0_card_already_in_v1_security_shape_is_unchanged():
+    card = _persisted_flat_security_card("1.0")
+    card["securitySchemes"] = _V1_LITELLM_SECURITY_SCHEMES
+    card.pop("security")
+    card["securityRequirements"] = _V1_LITELLM_SECURITY_REQUIREMENTS
+    assert normalize_agent_card(card, "1.0") is card
+
+
 def test_detect_card_version_normalizes_semver_protocol_version():
     from litellm.proxy.a2a.version_convert import _detect_card_version
 
     assert _detect_card_version({"protocolVersion": "1.0.0"}) == "1.0"
-    assert (
-        _detect_card_version({"protocolVersion": "0.3.0", "supportedInterfaces": []})
-        == "0.3"
-    )
+    assert _detect_card_version({"protocolVersion": "0.3.0", "supportedInterfaces": []}) == "0.3"
