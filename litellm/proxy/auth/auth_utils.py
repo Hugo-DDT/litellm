@@ -9,6 +9,7 @@ from itertools import accumulate, chain, repeat
 from logging import Logger
 from types import MappingProxyType
 from typing import Any, Final, Literal, Protocol, TypeAlias
+from urllib.parse import unquote
 
 from fastapi import HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, PositiveInt, TypeAdapter, ValidationError
@@ -2665,6 +2666,7 @@ def video_access_group(
 
 
 _INTERACTION_BY_ID_ROUTE_MARKERS: Final = ("/interactions/",)
+_INTERACTION_ID_IN_PATH: Final = re.compile(r"^(?:/v1beta)?/interactions/([^/]+)(?:/cancel)?$")
 
 
 def _group_of_deployment_selector(selector: object, llm_router: Router | None) -> object:
@@ -2800,7 +2802,28 @@ def _extract_model_candidates_from_request(
                 ),
             )
 
+    if selects_by_interaction_id and not candidates:
+        _append_model_candidates(
+            candidates,
+            _group_of_deployment_selector(_creating_deployment_on_request(route, request_data), llm_router),
+        )
+
     return _dedupe_model_candidates(candidates)
+
+
+def _creating_deployment_on_request(route: str, request_data: Mapping[str, object]) -> str | None:
+    from litellm.interactions.deployment_affinity import deployment_id_of_interaction
+
+    supplied: Final = request_data.get("interaction_id")
+    interaction_id: Final = supplied if isinstance(supplied, str) and supplied else _interaction_id_from_route(route)
+    return deployment_id_of_interaction(interaction_id)
+
+
+def _interaction_id_from_route(route: str) -> str | None:
+    found: Final = _INTERACTION_ID_IN_PATH.fullmatch(route)
+    if found is None:
+        return None
+    return unquote(found.group(1))
 
 
 def _format_model_candidates(

@@ -35,7 +35,7 @@ import asyncio
 import contextvars
 from collections.abc import AsyncIterator, Coroutine, Iterator, Mapping
 from functools import partial
-from typing import Final
+from typing import Final, cast
 
 import httpx
 
@@ -189,7 +189,14 @@ async def acreate(
             custom_llm_provider=custom_llm_provider,
         )
 
-        return response
+        if isinstance(response, InteractionsAPIResponse):
+            from litellm.interactions.deployment_affinity import client_facing_interaction
+
+            return client_facing_interaction(
+                response,
+                kwargs,  # pyright: ignore[reportUnknownArgumentType] # acreate's kwargs dict is untyped
+            )
+        return cast("InteractionsAPIResponse | AsyncIterator[InteractionsAPIStreamingResponse]", response)
     except Exception as e:
         raise litellm.exception_type(
             model=model,

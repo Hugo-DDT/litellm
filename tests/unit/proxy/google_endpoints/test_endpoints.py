@@ -913,3 +913,159 @@ def test_a_follow_up_reaches_a_deployment_the_callers_grant_covers(
 
     assert response.status_code == 200, response.text
     assert upstream.call_count == 1
+
+
+def _without_gemini_developer_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+
+@pytest.mark.respx(assert_all_called=False)
+@pytest.mark.parametrize(("method", "upstream_suffix"), tuple((method, suffix) for method, _, suffix in _BY_ID_CALLS))
+def test_id_only_follow_up_reaches_the_vertex_deployment_that_stored_the_interaction(
+    interactions_proxy: TestClient,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    upstream_suffix: str,
+) -> None:
+    _without_gemini_developer_api_key(monkeypatch)
+    created: Final = MappingProxyType(
+        {
+            project: respx_mock.post(_project_url(project)).mock(
+                return_value=httpx.Response(
+                    200, json={"id": _INTERACTION_ID, "object": "interaction", "status": "completed"}
+                )
+            )
+            for project in _SPLIT_DEPLOYMENTS.values()
+        }
+    )
+    followed_up: Final = MappingProxyType(
+        {
+            project: respx_mock.request(method, f"{_project_url(project)}/{_INTERACTION_ID}{upstream_suffix}").mock(
+                return_value=httpx.Response(200, json=_INTERACTION)
+            )
+            for project in _SPLIT_DEPLOYMENTS.values()
+        }
+    )
+
+    create: Final = interactions_proxy.post("/v1beta/interactions", json={"model": _SPLIT_GROUP, "input": "Hi"})
+    deployment_id: Final = create.headers["x-litellm-model-id"]
+    project: Final = _SPLIT_DEPLOYMENTS[deployment_id]
+    interaction_id: Final = create.json()["id"]
+    follow_up: Final = interactions_proxy.request(method, f"/v1beta/interactions/{interaction_id}{upstream_suffix}")
+
+    assert create.status_code == 200, create.text
+    assert created[project].call_count == 1
+    assert follow_up.status_code == 200, follow_up.text
+    assert follow_up.json()["id"] == interaction_id
+    assert {name: route.call_count for name, route in followed_up.items()} == {
+        name: 1 if name == project else 0 for name in _SPLIT_DEPLOYMENTS.values()
+    }
+    assert followed_up[project].calls.last.request.url.path.endswith(f"/{_INTERACTION_ID}{upstream_suffix}")
+
+
+@pytest.mark.respx(assert_all_called=False)
+@pytest.mark.parametrize("selector", ("query", "header"))
+@pytest.mark.parametrize(("method", "upstream_suffix"), tuple((method, suffix) for method, _, suffix in _BY_ID_CALLS))
+def test_an_explicit_selector_still_routes_a_stored_vertex_interaction(
+    interactions_proxy: TestClient,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    selector: str,
+    method: str,
+    upstream_suffix: str,
+) -> None:
+    _without_gemini_developer_api_key(monkeypatch)
+    for project in _SPLIT_DEPLOYMENTS.values():
+        respx_mock.post(_project_url(project)).mock(
+            return_value=httpx.Response(
+                200, json={"id": _INTERACTION_ID, "object": "interaction", "status": "completed"}
+            )
+        )
+    followed_up: Final = MappingProxyType(
+        {
+            project: respx_mock.request(method, f"{_project_url(project)}/{_INTERACTION_ID}{upstream_suffix}").mock(
+                return_value=httpx.Response(200, json=_INTERACTION)
+            )
+            for project in _SPLIT_DEPLOYMENTS.values()
+        }
+    )
+
+    create: Final = interactions_proxy.post("/v1beta/interactions", json={"model": _SPLIT_GROUP, "input": "Hi"})
+    deployment_id: Final = create.headers["x-litellm-model-id"]
+    other_deployment_id: Final = next(name for name in _SPLIT_DEPLOYMENTS if name != deployment_id)
+    other_project: Final = _SPLIT_DEPLOYMENTS[other_deployment_id]
+    interaction_id: Final = create.json()["id"]
+    params, headers = _deployment_selector(selector, other_deployment_id)
+    follow_up: Final = interactions_proxy.request(
+        method, f"/v1beta/interactions/{interaction_id}{upstream_suffix}", params=params, headers=headers
+    )
+
+    assert create.status_code == 200, create.text
+    assert follow_up.status_code == 200, follow_up.text
+    assert {name: route.call_count for name, route in followed_up.items()} == {
+        name: 1 if name == other_project else 0 for name in _SPLIT_DEPLOYMENTS.values()
+    }
+    assert followed_up[other_project].calls.last.request.url.path.endswith(f"/{_INTERACTION_ID}{upstream_suffix}")
+
+
+@pytest.mark.respx(assert_all_called=False)
+@pytest.mark.parametrize(
+    ("key", "teams", "model", "project", "status_code"),
+    (
+        pytest.param(
+            UserAPIKeyAuth(models=[_VERTEX_GROUP]),
+            (),
+            "split-west",
+            "west-project",
+            403,
+            id="group-not-on-key",
+        ),
+        pytest.param(
+            UserAPIKeyAuth(team_id="team-without-split"),
+            (LiteLLM_TeamTableCachedObj(team_id="team-without-split", models=[_VERTEX_GROUP]),),
+            "split-west",
+            "west-project",
+            403,
+            id="group-not-on-team",
+        ),
+        pytest.param(_PUBLIC_KEY, (), "shared-priv", "priv-project", 400, id="deployment-outside-access-group"),
+    ),
+)
+@pytest.mark.parametrize(("method", "upstream_suffix"), tuple((method, suffix) for method, _, suffix in _BY_ID_CALLS))
+def test_id_only_follow_up_is_refused_when_the_key_cannot_call_the_creating_deployment(
+    interactions_proxy: TestClient,
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    key: UserAPIKeyAuth,
+    teams: tuple[LiteLLM_TeamTableCachedObj, ...],
+    model: str,
+    project: str,
+    status_code: int,
+    method: str,
+    upstream_suffix: str,
+) -> None:
+    _without_gemini_developer_api_key(monkeypatch)
+    respx_mock.post(_project_url(project)).mock(
+        return_value=httpx.Response(200, json={"id": _INTERACTION_ID, "object": "interaction", "status": "completed"})
+    )
+    respx_mock.request(method, f"{_project_url(project)}/{_INTERACTION_ID}{upstream_suffix}").mock(
+        return_value=httpx.Response(200, json=_INTERACTION)
+    )
+
+    create: Final = interactions_proxy.post("/v1beta/interactions", json={"model": model, "input": "Hi"})
+    interaction_id: Final = create.json()["id"]
+    with _cached_key(key, *teams) as authorization:
+        follow_up: Final = interactions_proxy.request(
+            method,
+            f"/v1beta/interactions/{interaction_id}{upstream_suffix}",
+            headers={"authorization": authorization},
+        )
+
+    assert create.status_code == 200, create.text
+    assert create.headers["x-litellm-model-id"] == model
+    assert follow_up.status_code == status_code, follow_up.text
+    assert [call.request.url.path for call in respx_mock.calls] == [
+        _project_url(project).removeprefix("https://aiplatform.googleapis.com")
+    ]

@@ -1984,13 +1984,51 @@ class RustEndpoints:
             kwargs[  # rebind-ok: the request kwargs are shaped in place, as the Python router shapes them
                 "custom_llm_provider"
             ] = "gemini"
+        from litellm.interactions.deployment_affinity import (
+            deployment_id_of_interaction,
+            raw_interaction_id,
+            with_client_interaction_id,
+        )
+
+        requested_interaction_id: Final = kwargs.get("interaction_id")
+        requested_previous_id: Final = kwargs.get("previous_interaction_id")
+        raw_id: Final = raw_interaction_id(requested_interaction_id)
+        if raw_id is not None:
+            kwargs[
+                "interaction_id"
+            ] = (  # rebind-ok: the request kwargs are shaped in place, as the Python router shapes them
+                raw_id
+            )
+        previous_raw_id: Final = raw_interaction_id(requested_previous_id)
+        if previous_raw_id is not None:
+            kwargs[
+                "previous_interaction_id"
+            ] = (  # rebind-ok: the request kwargs are shaped in place, as the Python router shapes them
+                previous_raw_id
+            )
         if kwargs.get("agent") and kwargs.get("model") == kwargs.get("agent"):
             kwargs["model"] = (  # rebind-ok: the request kwargs are shaped in place, as the Python router shapes them
                 None
             )
+        pinned_deployment: Final = (
+            None
+            if kwargs.get("model")
+            else deployment_id_of_interaction(requested_interaction_id)
+            or deployment_id_of_interaction(requested_previous_id)
+        )
+        if pinned_deployment is not None:
+            kwargs["model"] = (  # rebind-ok: the request kwargs are shaped in place, as the Python router shapes them
+                pinned_deployment
+            )
+
+        def for_client(answered: object) -> object:
+            if raw_id is None or not isinstance(requested_interaction_id, str):
+                return answered
+            return with_client_interaction_id(answered, requested_interaction_id)
+
         if kwargs.get("model"):
-            return await self._ageneric(plan, kwargs)
-        return await self._direct(plan.host_op, kwargs)
+            return for_client(await self._ageneric(plan, kwargs))
+        return for_client(await self._direct(plan.host_op, kwargs))
 
     def _managed_agents(self, name: str) -> Callable[..., object]:
         op: Final = _MANAGED_AGENTS[name]
